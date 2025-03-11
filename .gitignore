@@ -1,3 +1,5 @@
 .vnv
 md
 results.json
+sysgen.egg-info
+__pycache__
