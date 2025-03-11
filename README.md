@@ -59,7 +59,7 @@ If you find a bug or have suggestions for improvement, feel free to open an issu
 1. **Fork the Repository**: Start by forking the project on GitHub.
 2. **Clone the Repository**: Clone it to your local machine using:
    ```sh
-   git clone https://github.com/Adhishtanaka/SysGen.git
+   git clone https://github.com//your-username/sysgen.git
    ```
 3. **Create a Branch**: Create a new branch for your changes:
    ```sh
