@@ -5,7 +5,7 @@ setup(
     version="0.1.0",
     author="Adhishtanaka",
     author_email="kulasoooriyaa@gmail.com",
-    description="A CLI tool for AI-powered system text generation",
+    description="SynGen is a CLI tool that creates high-quality synthetic datasets using the Gemini API",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     url="https://github.com/adhishtanaka/sysgen",  
