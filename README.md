@@ -1,5 +1,5 @@
-# SynGen
-SynGen is a tool that creates high-quality synthetic datasets using the Gemini API. It analyzes Markdown documents to generate realistic and diverse examples for machine learning, software testing, and data analysis.
+# Sysgen
+Sysgen is a CLI tool that creates high-quality synthetic datasets using the Gemini API. It analyzes Markdown documents to generate realistic and diverse examples for machine learning, software testing, and data analysis.
 
 ## Features
 - **Automated Q&A Generation**: Extracts questions and answers from Markdown files using AI.
