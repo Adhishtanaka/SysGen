@@ -8,7 +8,7 @@ from google import genai
 api_key = os.getenv("GEMINI_API_KEY")
 
 client = genai.Client(api_key=api_key)
-model = "gemini-2.0-flash-exp"
+model = "gemini-2.0-flash"
 
 def generate_answers(chunk, questions):
     prompt = f"""
