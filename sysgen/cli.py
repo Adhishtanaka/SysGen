@@ -1,26 +1,244 @@
 import os
-import time
 import json
 import argparse
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from typing import List, Dict
 from google import genai
-
+import tiktoken
+import re
 
 api_key = os.getenv("GEMINI_API_KEY")
 
 client = genai.Client(api_key=api_key)
 model = "gemini-2.0-flash"
 
+class DocumentChunker:
+    def __init__(self, max_tokens=3000, overlap=200):
+        self.max_tokens = max_tokens
+        self.overlap = overlap
+        self.encoder = tiktoken.encoding_for_model("gpt-3.5-turbo")
+    
+    def count_tokens(self, text: str) -> int:
+        return len(self.encoder.encode(text))
+    
+    def split_by_sentences(self, text: str) -> List[str]:
+        """Split text into sentences"""
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        return [s.strip() for s in sentences if s.strip()]
+    
+    def chunk_document(self, text: str) -> List[str]:
+        """Split document into chunks with overlap"""
+        if self.count_tokens(text) <= self.max_tokens:
+            return [text]
+        
+        sentences = self.split_by_sentences(text)
+        chunks = []
+        current_chunk = ""
+        current_tokens = 0
+        
+        for sentence in sentences:
+            sentence_tokens = self.count_tokens(sentence)
+            
+            if current_tokens + sentence_tokens > self.max_tokens:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                    
+                    # Add overlap from the end of current chunk
+                    overlap_sentences = self.get_overlap_sentences(current_chunk)
+                    current_chunk = overlap_sentences + " " + sentence
+                    current_tokens = self.count_tokens(current_chunk)
+                else:
+                    # Single sentence too long, add it anyway
+                    chunks.append(sentence)
+                    current_chunk = ""
+                    current_tokens = 0
+            else:
+                current_chunk += " " + sentence
+                current_tokens += sentence_tokens
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+    
+    def get_overlap_sentences(self, chunk: str) -> str:
+        """Get last few sentences for overlap"""
+        sentences = self.split_by_sentences(chunk)
+        overlap_text = ""
+        tokens = 0
+        
+        for sentence in reversed(sentences):
+            sentence_tokens = self.count_tokens(sentence)
+            if tokens + sentence_tokens > self.overlap:
+                break
+            overlap_text = sentence + " " + overlap_text
+            tokens += sentence_tokens
+        
+        return overlap_text.strip()
+
+class SmartQuestionGenerator:
+    def __init__(self, model_name="gemini-2.0-flash"):
+        self.model = model_name
+        self.client = client
+    
+    def generate_comprehensive_questions(self, chunk: str) -> List[str]:
+        """Generate as many relevant questions as possible from the content"""
+        
+        question_instruction = """Extract EVERY possible question that can be answered from this text. Your goal is to create a comprehensive question dataset that covers all information in the content.
+
+            EXTRACTION STRATEGY:
+            1. Read through the entire text systematically
+            2. Generate questions for EVERY fact, concept, process, relationship, and detail mentioned
+            3. Create questions at multiple levels: basic facts, deeper understanding, analysis, implications
+            4. Don't limit yourself - extract as many unique questions as the content supports
+            5. Continue until you've exhausted all questionable content from the text
+            6. Each question should test a different piece of information or understanding
+
+            QUESTION TYPES TO INCLUDE:
+            - Factual questions (who, what, when, where)
+            - Conceptual questions (why, how does this work)
+            - Analytical questions (what are the implications, relationships)
+            - Comparative questions (how does X compare to Y)
+            - Process questions (how is this done, what are the steps)
+            - Application questions (how would this be used)
+            - Definitional questions (what is the meaning of X)
+            - Causal questions (what causes X, what are the effects)"""
+        
+        prompt = f"""
+        Based on the following text, {question_instruction}
+
+        TEXT:
+        {chunk}
+
+        COMPREHENSIVE QUESTION GENERATION RULES:
+        1. Generate AS MANY questions as possible that can be answered from this text
+        2. Each question must be unique and test different information
+        3. Focus on ONE specific concept/fact per question
+        4. Use clear, direct language
+        5. End each question with a question mark
+        6. Avoid compound questions (no "and", "or" connecting multiple ideas)
+        7. Make questions contextually specific to this content
+        8. Include variety: what, why, how, when, where, who questions
+        9. Extract questions until no more meaningful questions can be formed
+        10. Prioritize question coverage over arbitrary limits
+
+        Your mission is to create a comprehensive question dataset - generate as many as the content supports!
+
+        FORMAT: Return as JSON array of question strings only.
+        """
+        
+        try:
+            response = self.client.models.generate_content(model=self.model, contents=prompt)
+            questions_text = response.text
+            
+            # Extract JSON array
+            json_start = questions_text.find('[')
+            json_end = questions_text.rfind(']') + 1
+            if json_start >= 0 and json_end > json_start:
+                questions_json = questions_text[json_start:json_end]
+                questions = json.loads(questions_json)
+                print(f"Generated {len(questions)} questions from chunk")
+                return questions
+            else:
+                print("No valid JSON array found in response")
+                return []
+        except Exception as e:
+            print(f"Error generating questions: {e}")
+            return []
+
+class AnswerGenerator:
+    def __init__(self, model_name="gemini-2.0-flash"):
+        self.model = model_name
+        self.client = client
+    
+    def generate_answers(self, chunk: str, questions: List[str]) -> List[str]:
+        """Generate answers for questions"""
+        prompt = f"""
+        Based on the following text, provide thorough answers to each question.
+        
+        TEXT:
+        {chunk}
+        
+        QUESTIONS:
+        {json.dumps(questions)}
+        
+        ANSWER REQUIREMENTS:
+        1. Each answer must be exactly 4-5 sentences long
+        2. Provide detailed explanations with context from the text
+        3. Include supporting evidence or reasoning
+        4. Make answers self-contained and complete
+        5. Use clear, informative language
+        6. Start each answer with "Answer: " followed by your explanation
+        
+        FORMAT: 
+        - Separate each answer with "---" on its own line
+        - Don't repeat the questions in your response
+        - Keep answers focused and comprehensive
+        """
+        
+        try:
+            response = self.client.models.generate_content(model=self.model, contents=prompt)
+            answers_text = response.text.strip()
+            answer_list = answers_text.split('---')
+            processed_answers = []
+            
+            for answer in answer_list:
+                cleaned_answer = answer.strip()
+                if cleaned_answer.startswith("Answer:"):
+                    cleaned_answer = cleaned_answer[7:].strip()
+                if cleaned_answer:
+                    processed_answers.append(cleaned_answer)
+            
+            return processed_answers
+        except Exception as e:
+            print(f"Error generating answers: {e}")
+            return []
+
+class FormatConverter:
+    @staticmethod
+    def to_alpaca(question: str, answer: str, source_doc: str = "") -> Dict:
+        """Convert to Alpaca format"""
+        return {
+            "instruction": question,
+            "input": "",
+            "output": answer,
+            "source_document": source_doc
+        }
+    
+    @staticmethod
+    def to_chatml(question: str, answer: str, source_doc: str = "") -> Dict:
+        """Convert to ChatML format"""
+        return {
+            "messages": [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": answer}
+            ],
+            "source_document": source_doc
+        }
+    
+    @staticmethod
+    def to_conversation(question: str, answer: str, source_doc: str = "") -> Dict:
+        """Convert to conversation format"""
+        return {
+            "conversations": [
+                {"from": "human", "value": question},
+                {"from": "gpt", "value": answer}
+            ],
+            "source_document": source_doc
+        }
+
 class DuplicateDetector:
-    def __init__(self, similarity_threshold=0.8):
+    def __init__(self, similarity_threshold=0.85):
         self.similarity_threshold = similarity_threshold
         self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
     
-    def semantic_duplicate_detection(self, questions: List[str]) -> List[List[int]]:
-        """Find semantic duplicates using sentence embeddings"""
-        print("Checking for semantic duplicates...")
+    def find_duplicates(self, questions: List[str]) -> List[List[int]]:
+        """Find semantic duplicates using embeddings"""
+        if len(questions) < 2:
+            return []
+        
+        print(f"Checking for semantic duplicates among {len(questions)} questions...")
         embeddings = self.sentence_model.encode(questions)
         similarity_matrix = cosine_similarity(embeddings)
         
@@ -31,336 +249,183 @@ class DuplicateDetector:
             if i in processed:
                 continue
                 
-            similar_indices = []
-            for j in range(i, len(questions)):
-                if similarity_matrix[i][j] >= self.similarity_threshold:
+            similar_indices = [i]
+            for j in range(i + 1, len(questions)):
+                if j not in processed and similarity_matrix[i][j] >= self.similarity_threshold:
                     similar_indices.append(j)
-                    processed.add(j)
             
             if len(similar_indices) > 1:
                 duplicate_groups.append(similar_indices)
+                processed.update(similar_indices)
         
         return duplicate_groups
-
-class DuplicateRemover:
-    def __init__(self):
-        pass
     
-    def calculate_quality_score(self, question: str, answer: str) -> float:
-        """Calculate quality score for a Q&A pair"""
-        score = 0
+    def remove_duplicates(self, qa_pairs: List[Dict]) -> List[Dict]:
+        """Remove duplicate Q&A pairs"""
+        if not qa_pairs:
+            return qa_pairs
         
-        # Question length (prefer 5-20 words)
-        q_len = len(question.split())
-        if 5 <= q_len <= 20:
-            score += 1
+        # Extract questions based on format
+        questions = []
+        for qa in qa_pairs:
+            if "instruction" in qa:
+                questions.append(qa["instruction"])
+            elif "messages" in qa:
+                questions.append(qa["messages"][0]["content"])
+            elif "conversations" in qa:
+                questions.append(qa["conversations"][0]["value"])
+            else:
+                questions.append("")
         
-        # Answer length (prefer 20-200 words)
-        a_len = len(answer.split())
-        if 20 <= a_len <= 200:
-            score += 1
+        duplicate_groups = self.find_duplicates(questions)
         
-        # Proper capitalization
-        if question[0].isupper():
-            score += 0.5
+        if not duplicate_groups:
+            return qa_pairs
         
-        # Question mark
-        if question.strip().endswith('?'):
-            score += 0.5
-        
-        # Answer diversity (avoid repetition)
-        words = answer.lower().split()
-        if len(words) > 0:
-            unique_words = set(words)
-            if len(unique_words) / len(words) > 0.7:
-                score += 1
-        
-        return score
-    
-    def remove_duplicates(self, qa_pairs: List[Dict], duplicate_groups: List[List[int]]) -> List[Dict]:
-        """Keep the highest quality example from each duplicate group"""
         indices_to_remove = set()
-        
         for group in duplicate_groups:
-            if len(group) <= 1:
-                continue
-            
-            # Calculate quality scores for all items in group
-            quality_scores = []
-            for idx in group:
-                qa_pair = qa_pairs[idx]
-                question = qa_pair['data'][0]['instruction']
-                answer = qa_pair['data'][1]['output']
-                score = self.calculate_quality_score(question, answer)
-                quality_scores.append((idx, score))
-            
-            # Sort by quality score (descending)
-            quality_scores.sort(key=lambda x: x[1], reverse=True)
-            
-            # Keep the best one, mark others for removal
-            for idx, _ in quality_scores[1:]:
-                indices_to_remove.add(idx)
+            # Keep the first one, remove the rest
+            indices_to_remove.update(group[1:])
         
-        # Remove duplicates
         cleaned_pairs = [qa_pairs[i] for i in range(len(qa_pairs)) if i not in indices_to_remove]
+        
+        print(f"Removed {len(indices_to_remove)} duplicate questions")
         return cleaned_pairs
 
-def merge_overlapping_groups(groups: List[List[int]]) -> List[List[int]]:
-    """Merge groups that have overlapping indices"""
-    if not groups:
-        return []
-    
-    set_groups = [set(group) for group in groups]
-    merged = []
-    
-    while set_groups:
-        current = set_groups.pop(0)
-        merged_with_current = True
-        
-        while merged_with_current:
-            merged_with_current = False
-            for i, other in enumerate(set_groups):
-                if current & other:
-                    current = current | other
-                    set_groups.pop(i)
-                    merged_with_current = True
-                    break
-        
-        merged.append(list(current))
-    
-    return merged
-
-def remove_duplicates_from_qa_pairs(qa_pairs: List[Dict], similarity_threshold: float = 0.8) -> List[Dict]:
-    """Remove duplicates from QA pairs"""
-    if not qa_pairs:
-        return qa_pairs
-    
-    print(f"Original QA pairs: {len(qa_pairs)}")
-    
-    # Extract questions for duplicate detection
-    questions = [qa_pair['data'][0]['instruction'] for qa_pair in qa_pairs]
-    
-    # Initialize detector and remover
-    detector = DuplicateDetector(similarity_threshold)
-    remover = DuplicateRemover()
-    
-    # Detect semantic duplicates only
-    semantic_groups = detector.semantic_duplicate_detection(questions)
-    
-    print(f"Found {len(semantic_groups)} duplicate groups")
-    
-    # Remove duplicates
-    cleaned_pairs = remover.remove_duplicates(qa_pairs, semantic_groups)
-    
-    print(f"Cleaned QA pairs: {len(cleaned_pairs)}")
-    print(f"Removed {len(qa_pairs) - len(cleaned_pairs)} duplicates")
-    
-    return cleaned_pairs
-
-def generate_answers(chunk, questions):
-    prompt = f"""
-    Based on the following text from a document, provide thorough and well-explained answers to each of the following questions.
-    
-    TEXT:
-    {chunk}
-    
-    QUESTIONS:
-    {json.dumps(questions)}
-    
-    INSTRUCTIONS FOR ANSWERING:
-    1. EVERY answer MUST be exactly 4-5 sentences long - this is crucial
-    2. Provide detailed explanations with relevant context from the text
-    3. Include supporting evidence or reasoning in each answer
-    4. Structure each answer to have a clear beginning, explanation, and conclusion
-    5. Be concise but comprehensive within the 4-5 sentence constraint
-    6. Start each answer with "Answer: " followed by your explanation
-    7. Generate only ONE single question (not compound questions like "What is X and why is it important?")
-    8. Each generated question should ask about ONE concept only
-    
-    FORMAT: 
-    * Keep each answer self-contained
-    * Separate answers with "---" on its own line
-    * Don't repeat the questions in your response
-    """
+def process_document(file_path: str, output_file: str, args) -> bool:
+    """Process a single document"""
     try:
-        response = client.models.generate_content(model=model, contents=prompt)
-        answers_text = response.text.strip()
-        answer_list = answers_text.split('---')
-        processed_answers = []
-        for answer in answer_list: 
-            cleaned_answer = answer.strip()
-            if cleaned_answer.startswith("Answer:"):
-                cleaned_answer = cleaned_answer[7:].strip()
-            if cleaned_answer: 
-                processed_answers.append(cleaned_answer)
+        with open(file_path, "r", encoding="utf-8") as file:
+            content = file.read()
         
-        return processed_answers
-    except Exception as e:
-        print(f"Error generating answers: {e}")
-        return []
-
-def generate_diverse_questions(chunk, num_questions):
-    prompt = f"""
-    Based on the following text from a document, generate {num_questions} diverse and specific questions that could be asked about this content.
-
-    INSTRUCTIONS FOR QUESTION GENERATION:
-    1. Make questions clear, direct, and focused on a SINGLE concept
-    2. Each question should address only ONE specific aspect from the text
-    3. Avoid compound questions or connecting multiple ideas with "and" or commas
-    4. Ensure questions are contextually grounded in the document's content
-    5. Questions should clearly indicate what specific information they're seeking
-    6. Use proper grammar and punctuation
-    7. Keep questions concise - aim for 15 words or fewer per question
-    8. Each question should have clear relevance to the document subject
-
-    TEXT:
-    {chunk}
-
-    FORMAT YOUR RESPONSE AS A JSON ARRAY OF QUESTION STRINGS ONLY.
-    """
-
-    try:
-        response = client.models.generate_content(model=model, contents=prompt)
-        questions_text = response.text
-        json_start = questions_text.find('[')
-        json_end = questions_text.rfind(']') + 1
-        if json_start >= 0 and json_end > json_start:
-            questions_json = questions_text[json_start:json_end]
-            questions = json.loads(questions_json)
-            return questions
-        else:
-            return []
-    except Exception as e:
-        print(f"Error generating questions: {e}")
-        return []
-
-def process_single_textfile(textfile_path, output_file, num_questions, run_number):
-    all_conversations = []
-
-    try:
-        with open(textfile_path, "r", encoding="utf-8") as file:
-            chunk = file.read()
-
-        questions = generate_diverse_questions(chunk, num_questions)
-        answers = generate_answers(chunk, questions)
-
-        for question, answer in zip(questions, answers):
-            if question and answer:
-                sentence_count = len([s for s in answer.split(".") if s.strip()])
-                if 3 <= sentence_count <= 6:
-                    alpaca_conversation = [
-                        {"instruction": question},
-                        {"output": answer},
-                    ]
-                    all_conversations.append(
-                        {
-                            "data": alpaca_conversation,
-                            "source_document": os.path.basename(textfile_path),
-                            "run_number": run_number,
-                        }
-                    )
-
+        # Initialize components
+        chunker = DocumentChunker()
+        question_gen = SmartQuestionGenerator()
+        answer_gen = AnswerGenerator()
+        format_converter = FormatConverter()
+        
+        # Chunk the document
+        chunks = chunker.chunk_document(content)
+        print(f"Split document into {len(chunks)} chunks")
+        
+        all_qa_pairs = []
+        total_questions = 0
+        
+        for i, chunk in enumerate(chunks):
+            print(f"Processing chunk {i+1}/{len(chunks)}")
+            
+            # Generate comprehensive questions
+            questions = question_gen.generate_comprehensive_questions(chunk)
+            total_questions += len(questions)
+            
+            # Generate answers
+            answers = answer_gen.generate_answers(chunk, questions)
+            
+            # Create Q&A pairs
+            for question, answer in zip(questions, answers):
+                if question and answer:
+                    # Validate answer length
+                    sentence_count = len([s for s in answer.split(".") if s.strip()])
+                    if 3 <= sentence_count <= 6:
+                        # Convert to specified format
+                        if args.format == "alpaca":
+                            qa_pair = format_converter.to_alpaca(
+                                question, answer, os.path.basename(file_path)
+                            )
+                        elif args.format == "chatml":
+                            qa_pair = format_converter.to_chatml(
+                                question, answer, os.path.basename(file_path)
+                            )
+                        elif args.format == "conversation":
+                            qa_pair = format_converter.to_conversation(
+                                question, answer, os.path.basename(file_path)
+                            )
+                        
+                        all_qa_pairs.append(qa_pair)
+        
+        # Remove duplicates (enabled by default)
+        detector = DuplicateDetector(args.similarity_threshold)
+        initial_count = len(all_qa_pairs)
+        all_qa_pairs = detector.remove_duplicates(all_qa_pairs)
+        print(f"Kept {len(all_qa_pairs)} out of {initial_count} Q&A pairs after duplicate removal")
+        
+        # Save to file
         if os.path.exists(output_file):
             with open(output_file, "r", encoding="utf-8") as f:
                 existing_data = json.load(f)
         else:
             existing_data = []
-
-        existing_data.extend(all_conversations)
-
+        
+        existing_data.extend(all_qa_pairs)
+        
         with open(output_file, "w", encoding="utf-8") as f:
-            json.dump(existing_data, f, indent=2)
-
-        print(
-            f"Run {run_number}: Generated {len(all_conversations)} QA pairs for {textfile_path}"
-        )
+            json.dump(existing_data, f, indent=2, ensure_ascii=False)
+        
+        print(f"Generated {len(all_qa_pairs)} Q&A pairs from {total_questions} total questions for {file_path}")
         return True
-
+    
     except Exception as e:
-        print(f"Run {run_number}: Error processing file {textfile_path}: {e}")
+        print(f"Error processing {file_path}: {e}")
         return False
 
-def clean_duplicates_from_file(output_file, similarity_threshold=0.8):
-    """Clean duplicates from the output file"""
-    if not os.path.exists(output_file):
-        print(f"Output file {output_file} does not exist.")
-        return
-    
-    print(f"\nCleaning duplicates from {output_file}...")
-    
-    with open(output_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    
-    # Remove duplicates
-    cleaned_data = remove_duplicates_from_qa_pairs(data, similarity_threshold)
-    
-    # Save cleaned data
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(cleaned_data, f, indent=2)
-    
-    print(f"Cleaned data saved to {output_file}")
-
-def process_all_md_files(md_folder, output_file, num_questions, repeat, similarity_threshold):
-    md_files = [f for f in os.listdir(md_folder) if f.endswith(".md")]
-
-    for md_file in md_files:
-        md_path = os.path.join(md_folder, md_file)
-        for run in range(1, repeat + 1):
-            print(f"Run {run}/{repeat}: Processing: {md_path}")
-            success = process_single_textfile(md_path, output_file, num_questions, run)
-
-            if success:
-                print(
-                    f"Run {run}/{repeat}: Completed: {md_path}. Waiting 60 seconds before next run..."
-                )
-                time.sleep(60)
-            else:
-                print(f"Run {run}/{repeat}: Skipping: {md_path} due to an error.")
-    
-    # Clean duplicates after all processing is done
-    clean_duplicates_from_file(output_file, similarity_threshold)
-
 def main():
-    parser = argparse.ArgumentParser(description="AI-powered Q&A generator with duplicate removal")
-    parser.add_argument(
-        "--md-folder", type=str, default="md", help="Folder containing markdown files"
-    )
-    parser.add_argument(
-        "--output", type=str, default="output.json", help="Output JSON file"
-    )
-    parser.add_argument(
-        "--num-questions",
-        type=int,
-        default=100,
-        help="Number of questions per document",
-    )
-    parser.add_argument(
-        "--repeat", type=int, default=1, help="How many times to process each document"
-    )
-    parser.add_argument(
-        "--similarity-threshold", type=float, default=0.8, help="Similarity threshold for duplicate detection (0.0-1.0)"
-    )
+    parser = argparse.ArgumentParser(description="Sysgen - High-quality synthetic datasets creating Tool")
+    
+    # Input/Output
+    parser.add_argument("--input-folder", type=str, default="md", help="Folder containing markdown files")
+    parser.add_argument("--output", type=str, default="output.json", help="Output JSON file")
+    
+    # Format options
+    parser.add_argument("--format", type=str, choices=["alpaca", "chatml", "conversation"], 
+                       default="alpaca", help="Output format")
+    
+    # Duplicate handling
+    parser.add_argument("--similarity-threshold", type=float, default=0.85, help="Similarity threshold for duplicates")
     
     args = parser.parse_args()
-
-    if not api_key:
-        print(
-            "Error: API key is required. Set GEMINI_API_KEY environment variable."
-        )
-        return
-
-    print(f"Processing Markdown files from {args.md_folder}")
-    print(f"Number of questions per document: {args.num_questions}")
-    print(f"Repetitions per document: {args.repeat}")
-    print(f"Similarity threshold: {args.similarity_threshold}")
     
-    process_all_md_files(
-        args.md_folder, 
-        args.output, 
-        args.num_questions, 
-        args.repeat, 
-        args.similarity_threshold
-    )
+    if not api_key:
+        print("Error: GEMINI_API_KEY environment variable is required")
+        return
+    
+    # Find markdown files
+    if not os.path.exists(args.input_folder):
+        print(f"Error: Input folder {args.input_folder} does not exist")
+        return
+    
+    md_files = [f for f in os.listdir(args.input_folder) if f.endswith(('.md', '.txt'))]
+    
+    if not md_files:
+        print(f"No markdown/text files found in {args.input_folder}")
+        return
+    
+    print(f"Found {len(md_files)} files to process")
+    print(f"Format: {args.format}")
+    print(f"Chunk size: 3000 tokens (default)")
+    print(f"Overlap: 200 tokens (default)")
+    print("Duplicate removal: Enabled (default)")
+    
+    # Process files
+    total_qa_pairs = 0
+    for md_file in md_files:
+        file_path = os.path.join(args.input_folder, md_file)
+        print(f"\nProcessing {md_file}")
+        
+        success = process_document(file_path, args.output, args)
+        
+        if success:
+            print(f"Completed {md_file}")
+            # Count current total
+            if os.path.exists(args.output):
+                with open(args.output, "r", encoding="utf-8") as f:
+                    current_data = json.load(f)
+                    total_qa_pairs = len(current_data)
+        else:
+            print(f"Failed to process {md_file}")
+    
+    print(f"\nProcessing complete!")
+    print(f"Total Q&A pairs generated: {total_qa_pairs}")
+    print(f"Output saved to {args.output}")
 
 if __name__ == "__main__":
     main()
