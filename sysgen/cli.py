@@ -2,6 +2,9 @@ import os
 import time
 import json
 import argparse
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from typing import List, Dict
 from google import genai
 
 
@@ -9,6 +12,150 @@ api_key = os.getenv("GEMINI_API_KEY")
 
 client = genai.Client(api_key=api_key)
 model = "gemini-2.0-flash"
+
+class DuplicateDetector:
+    def __init__(self, similarity_threshold=0.8):
+        self.similarity_threshold = similarity_threshold
+        self.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    
+    def semantic_duplicate_detection(self, questions: List[str]) -> List[List[int]]:
+        """Find semantic duplicates using sentence embeddings"""
+        print("Checking for semantic duplicates...")
+        embeddings = self.sentence_model.encode(questions)
+        similarity_matrix = cosine_similarity(embeddings)
+        
+        duplicate_groups = []
+        processed = set()
+        
+        for i in range(len(questions)):
+            if i in processed:
+                continue
+                
+            similar_indices = []
+            for j in range(i, len(questions)):
+                if similarity_matrix[i][j] >= self.similarity_threshold:
+                    similar_indices.append(j)
+                    processed.add(j)
+            
+            if len(similar_indices) > 1:
+                duplicate_groups.append(similar_indices)
+        
+        return duplicate_groups
+
+class DuplicateRemover:
+    def __init__(self):
+        pass
+    
+    def calculate_quality_score(self, question: str, answer: str) -> float:
+        """Calculate quality score for a Q&A pair"""
+        score = 0
+        
+        # Question length (prefer 5-20 words)
+        q_len = len(question.split())
+        if 5 <= q_len <= 20:
+            score += 1
+        
+        # Answer length (prefer 20-200 words)
+        a_len = len(answer.split())
+        if 20 <= a_len <= 200:
+            score += 1
+        
+        # Proper capitalization
+        if question[0].isupper():
+            score += 0.5
+        
+        # Question mark
+        if question.strip().endswith('?'):
+            score += 0.5
+        
+        # Answer diversity (avoid repetition)
+        words = answer.lower().split()
+        if len(words) > 0:
+            unique_words = set(words)
+            if len(unique_words) / len(words) > 0.7:
+                score += 1
+        
+        return score
+    
+    def remove_duplicates(self, qa_pairs: List[Dict], duplicate_groups: List[List[int]]) -> List[Dict]:
+        """Keep the highest quality example from each duplicate group"""
+        indices_to_remove = set()
+        
+        for group in duplicate_groups:
+            if len(group) <= 1:
+                continue
+            
+            # Calculate quality scores for all items in group
+            quality_scores = []
+            for idx in group:
+                qa_pair = qa_pairs[idx]
+                question = qa_pair['data'][0]['instruction']
+                answer = qa_pair['data'][1]['output']
+                score = self.calculate_quality_score(question, answer)
+                quality_scores.append((idx, score))
+            
+            # Sort by quality score (descending)
+            quality_scores.sort(key=lambda x: x[1], reverse=True)
+            
+            # Keep the best one, mark others for removal
+            for idx, _ in quality_scores[1:]:
+                indices_to_remove.add(idx)
+        
+        # Remove duplicates
+        cleaned_pairs = [qa_pairs[i] for i in range(len(qa_pairs)) if i not in indices_to_remove]
+        return cleaned_pairs
+
+def merge_overlapping_groups(groups: List[List[int]]) -> List[List[int]]:
+    """Merge groups that have overlapping indices"""
+    if not groups:
+        return []
+    
+    set_groups = [set(group) for group in groups]
+    merged = []
+    
+    while set_groups:
+        current = set_groups.pop(0)
+        merged_with_current = True
+        
+        while merged_with_current:
+            merged_with_current = False
+            for i, other in enumerate(set_groups):
+                if current & other:
+                    current = current | other
+                    set_groups.pop(i)
+                    merged_with_current = True
+                    break
+        
+        merged.append(list(current))
+    
+    return merged
+
+def remove_duplicates_from_qa_pairs(qa_pairs: List[Dict], similarity_threshold: float = 0.8) -> List[Dict]:
+    """Remove duplicates from QA pairs"""
+    if not qa_pairs:
+        return qa_pairs
+    
+    print(f"Original QA pairs: {len(qa_pairs)}")
+    
+    # Extract questions for duplicate detection
+    questions = [qa_pair['data'][0]['instruction'] for qa_pair in qa_pairs]
+    
+    # Initialize detector and remover
+    detector = DuplicateDetector(similarity_threshold)
+    remover = DuplicateRemover()
+    
+    # Detect semantic duplicates only
+    semantic_groups = detector.semantic_duplicate_detection(questions)
+    
+    print(f"Found {len(semantic_groups)} duplicate groups")
+    
+    # Remove duplicates
+    cleaned_pairs = remover.remove_duplicates(qa_pairs, semantic_groups)
+    
+    print(f"Cleaned QA pairs: {len(cleaned_pairs)}")
+    print(f"Removed {len(qa_pairs) - len(cleaned_pairs)} duplicates")
+    
+    return cleaned_pairs
 
 def generate_answers(chunk, questions):
     prompt = f"""
@@ -87,7 +234,6 @@ def generate_diverse_questions(chunk, num_questions):
         print(f"Error generating questions: {e}")
         return []
 
-
 def process_single_textfile(textfile_path, output_file, num_questions, run_number):
     all_conversations = []
 
@@ -134,8 +280,27 @@ def process_single_textfile(textfile_path, output_file, num_questions, run_numbe
         print(f"Run {run_number}: Error processing file {textfile_path}: {e}")
         return False
 
+def clean_duplicates_from_file(output_file, similarity_threshold=0.8):
+    """Clean duplicates from the output file"""
+    if not os.path.exists(output_file):
+        print(f"Output file {output_file} does not exist.")
+        return
+    
+    print(f"\nCleaning duplicates from {output_file}...")
+    
+    with open(output_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    
+    # Remove duplicates
+    cleaned_data = remove_duplicates_from_qa_pairs(data, similarity_threshold)
+    
+    # Save cleaned data
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(cleaned_data, f, indent=2)
+    
+    print(f"Cleaned data saved to {output_file}")
 
-def process_all_md_files(md_folder, output_file, num_questions, repeat):
+def process_all_md_files(md_folder, output_file, num_questions, repeat, similarity_threshold):
     md_files = [f for f in os.listdir(md_folder) if f.endswith(".md")]
 
     for md_file in md_files:
@@ -151,10 +316,12 @@ def process_all_md_files(md_folder, output_file, num_questions, repeat):
                 time.sleep(60)
             else:
                 print(f"Run {run}/{repeat}: Skipping: {md_path} due to an error.")
-
+    
+    # Clean duplicates after all processing is done
+    clean_duplicates_from_file(output_file, similarity_threshold)
 
 def main():
-    parser = argparse.ArgumentParser(description="AI-powered Q&A generator")
+    parser = argparse.ArgumentParser(description="AI-powered Q&A generator with duplicate removal")
     parser.add_argument(
         "--md-folder", type=str, default="md", help="Folder containing markdown files"
     )
@@ -170,19 +337,30 @@ def main():
     parser.add_argument(
         "--repeat", type=int, default=1, help="How many times to process each document"
     )
+    parser.add_argument(
+        "--similarity-threshold", type=float, default=0.8, help="Similarity threshold for duplicate detection (0.0-1.0)"
+    )
+    
     args = parser.parse_args()
 
     if not api_key:
         print(
-            "Error: API key is required. Use --api-key or set API_KEY environment variable."
+            "Error: API key is required. Set GEMINI_API_KEY environment variable."
         )
         return
 
     print(f"Processing Markdown files from {args.md_folder}")
     print(f"Number of questions per document: {args.num_questions}")
     print(f"Repetitions per document: {args.repeat}")
-    process_all_md_files(args.md_folder, args.output, args.num_questions, args.repeat)
-
+    print(f"Similarity threshold: {args.similarity_threshold}")
+    
+    process_all_md_files(
+        args.md_folder, 
+        args.output, 
+        args.num_questions, 
+        args.repeat, 
+        args.similarity_threshold
+    )
 
 if __name__ == "__main__":
     main()

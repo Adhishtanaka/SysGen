@@ -1,8 +1,9 @@
+
 from setuptools import setup, find_packages
 
 setup(
     name="sysgen",  
-    version="0.1.1",
+    version="0.1.2",
     author="Adhishtanaka",
     author_email="kulasoooriyaa@gmail.com",
     description="sysgen is a CLI tool that creates high-quality synthetic datasets using the Gemini API",
@@ -12,7 +13,11 @@ setup(
     license="MIT",
     packages=find_packages(),
     install_requires=[
-         "google-genai",
+        "google-genai",
+        "pandas",
+        "numpy",
+        "sentence-transformers",
+        "scikit-learn",
     ],
     entry_points={
         "console_scripts": [
@@ -28,6 +33,8 @@ setup(
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
         "Operating System :: OS Independent",
     ],
     python_requires=">=3.7",
