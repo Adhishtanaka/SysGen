@@ -12,14 +12,14 @@ setup(
     license="MIT",
     packages=find_packages(),
     install_requires=[
-        "google-genai>=1.5.0",
-        "sentence-transformers>=5.0.0",
-        "scikit-learn>=1.7.0",
-        "tiktoken>=0.5.0",
-        "torch>=2.0.0",
-        "transformers>=4.30.0",
-        "numpy>=1.21.0",
-        "scipy>=1.7.0",
+        "google-genai",
+        "sentence-transformers",
+        "scikit-learn",
+        "tiktoken",
+        "torch",
+        "transformers",
+        "numpy",
+        "scipy",
         "tf-keras"
     ],
     entry_points={
