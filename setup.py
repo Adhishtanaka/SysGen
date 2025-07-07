@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="sysgen",  
-    version="0.2.1",
+    version="0.2.2",
     author="Adhishtanaka",
     author_email="kulasoooriyaa@gmail.com",
     description="SysGen - High-quality synthetic datasets creating tool using Gemini API",
